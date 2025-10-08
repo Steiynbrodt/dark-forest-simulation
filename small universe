@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""
+Mini Universe Simulator — "Matrix" Toy Model
+--------------------------------------------
+A playful agent-based galaxy sandbox:
+- 2D starfield grid with resources & habitability
+- Civilizations spawn, grow (logistic), research tech, expand
+- Trade (boosts tech) or conflict (reduces pop/tech) on contact
+- Random cosmic events (supernova, gamma burst) reshape tiles
+- Tkinter GUI: start/pause, step, reset, speed, spawn civ, sliders
+- Matplotlib render: heatmap (resources) + civ markers
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import numpy as np
+import math, random, time
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# -----------------------------
+# World & Civilization models
+# -----------------------------
+
+class Civ:
+    _next_id = 1
+    def __init__(self, x, y, color, name=None):
+        self.id = Civ._next_id; Civ._next_id += 1
+        self.name = name or f"Civ-{self.id}"
+        self.x = x; self.y = y
+        self.pop = random.uniform(1e4, 5e4)     # individuals
+        self.tech = random.uniform(0.5, 1.2)    # 0..∞
+        self.morale = 1.0                       # 0..2
+        self.color = color
+        self.alive = True
+        self.age = 0.0
+        self.territory = {(x,y)}
+
+class Universe:
+    def __init__(self, W=60, H=40, seed=None):
+        self.W = W; self.H = H
+        if seed is not None:
+            np.random.seed(seed); random.seed(seed)
+        # Base fields
+        self.resources = self._make_resources()
+        self.habit = self._make_habitability()
+        self.damage = np.zeros((H,W), dtype=float)  # 0..1 (recent catastrophe)
+        self.civs = []
+        self.t = 0
+        # Precompute neighbor list for speed
+        self.N8 = [(-1,-1), (0,-1), (1,-1),
+                   (-1, 0),         (1, 0),
+                   (-1, 1), (0, 1), (1, 1)]
+
+    def _make_resources(self):
+        # Layered noise: spiralish gradient + perlin-ish blobs
+        H, W = self.H, self.W
+        y,x = np.mgrid[0:H,0:W]
+        cx, cy = W/2, H/2
+        r = np.hypot(x-cx, y-cy)
+        base = 1.2 - (r / (max(W,H)/1.1))           # more at center
+        blobs = self._smooth_noise(H,W,octaves=3)
+        field = np.clip(base*0.6 + blobs*0.5, 0.05, 2.0)
+        # Normalize to ~[0.2, 1.5]
+        field = 0.2 + 1.3*(field - field.min())/(field.max()-field.min()+1e-9)
+        return field
+
+    def _make_habitability(self):
+        H, W = self.H, self.W
+        blobs = self._smooth_noise(H,W,octaves=2)
+        hab = 0.2 + 0.8*(blobs - blobs.min())/(blobs.max()-blobs.min()+1e-9)
+        return hab
+
+    def _smooth_noise(self, H, W, octaves=2):
+        # Simple multi-scale averaging
+        base = np.random.rand(H,W)
+        out = np.zeros_like(base)
+        weights = 0.0
+        for k in range(octaves):
+            scale = 2**k
+            small = base[::scale, ::scale]
+            out += self._resize_nearest(small, H, W) * (1.0/(k+1))
+            weights += (1.0/(k+1))
+        out /= weights
+        return out
+
+    def _resize_nearest(self, arr, H, W):
+        h, w = arr.shape
+        y_idx = (np.linspace(0, h-1, H)).astype(int)
+        x_idx = (np.linspace(0, w-1, W)).astype(int)
+        return arr[np.ix_(y_idx, x_idx)]
+
+    def in_bounds(self, x, y):
+        return 0 <= x < self.W and 0 <= y < self.H
+
+    def spawn_civ(self, x=None, y=None, color=None, name=None):
+        # pick viable tile
+        tries = 0
+        while (x is None or y is None) and tries < 200:
+            tx = random.randrange(self.W); ty = random.randrange(self.H)
+            if self.habit[ty,tx] * self.resources[ty,tx] > 0.25:
+                x, y = tx, ty; break
+            tries += 1
+        if x is None or y is None:
+            x = self.W//2; y = self.H//2
+        color = color or tuple(np.random.rand(3))
+        civ = Civ(x,y,color,name)
+        self.civs.append(civ)
+        return civ
+
+    # -----------------------------
+    # Simulation step
+    # -----------------------------
+    def step(self, dt,
+             k_growth=0.0008,
+             carry_base=3e7,
+             expansion_rate=0.15,
+             trade_bias=0.6,
+             aggression=0.4,
+             event_rate=0.02,
+             damage_decay=0.92):
+        """
+        dt: 'years' per tick (abstract). Tuned for visuals.
+        k_growth: intrinsic growth scaled by tech*habit
+        carry_base: base carrying capacity scaling with tile resources
+        expansion_rate: probability mass to try expansion/move
+        trade_bias: chance to trade instead of fight on contact
+        aggression: base conflict tendency (0..1)
+        event_rate: probability per tick of cosmic event
+        damage_decay: how fast catastrophe scars heal each step
+        """
+        H, W = self.H, self.W
+        self.t += dt
+        # Heal damaged tiles
+        self.damage *= damage_decay
+
+        # Random cosmic event
+        if random.random() < event_rate:
+            self._cosmic_event()
+
+        # Occupancy map (which civs are on which tile)
+        tile_civs = {}
+        for c in self.civs:
+            tile_civs.setdefault((c.x,c.y), []).append(c)
+
+        # Growth, research, morale drift
+        for c in list(self.civs):
+            if not c.alive: continue
+            res = self.resources[c.y, c.x]
+            hab = self.habit[c.y, c.x]
+            dmg = self.damage[c.y, c.x]
+            # effective carrying capacity
+            K = carry_base * res * hab * max(0.2, (1.0 - 0.7*dmg))
+            # capped logistic growth influenced by tech & habitability
+            growth = k_growth * c.pop * (1 - c.pop / (K + 1.0)) * (0.6 + 0.8*c.tech) * (0.4 + 0.9*hab)
+            c.pop = max(0.0, c.pop + growth*dt)
+            # research drift (faster on good tiles)
+            c.tech += 0.0002 * dt * (0.5 + res + 0.5*hab)
+            # morale softly tends to 1.0
+            c.morale += (1.0 - c.morale) * 0.002 * dt
+            c.age += dt
+            if c.pop < 500 or c.tech < 0.05:
+                c.alive = False
+
+        # Interactions on shared tiles
+        for (tx,ty), clist in tile_civs.items():
+            if len([c for c in clist if c.alive]) < 2:
+                continue
+            # pairwise interactions: chance to trade or fight
+            alive = [c for c in clist if c.alive]
+            random.shuffle(alive)
+            for i in range(0, len(alive)-1, 2):
+                a, b = alive[i], alive[i+1]
+                if random.random() < trade_bias * self._peace_factor(a,b):
+                    self._trade(a,b)
+                else:
+                    self._conflict(a,b, aggression)
+
+        # Expansion / movement
+        for c in self.civs:
+            if not c.alive: continue
+            if random.random() < expansion_rate * (0.5 + 0.7*c.tech):
+                self._try_expand_or_move(c)
+
+        # Cleanup dead civs
+        for c in self.civs:
+            if not c.alive:
+                # release territory slowly (optional)
+                pass
+
+        self.civs = [c for c in self.civs if c.alive]
+
+    # -----------------------------
+    # Interaction rules
+    # -----------------------------
+    def _peace_factor(self, a, b):
+        # more peaceful if tech high & morale stable
+        return max(0.1, min(1.0, 0.4 + 0.3*(a.morale+b.morale) + 0.3*(a.tech+b.tech)/4))
+
+    def _trade(self, a, b):
+        # bidirectional tech/morale buff proportional to local richness
+        r = (self.resources[a.y, a.x] + self.resources[b.y, b.x])*0.5
+        gain = 0.0015 * r
+        a.tech += gain; b.tech += gain
+        a.morale = min(2.0, a.morale + 0.02*r)
+        b.morale = min(2.0, b.morale + 0.02*r)
+
+    def _conflict(self, a, b, aggression):
+        # Casualties depend on tech*pop; morale can crash
+        power_a = a.pop * (0.6 + 0.7*a.tech)
+        power_b = b.pop * (0.6 + 0.7*b.tech)
+        if power_a + power_b <= 0: return
+        # outcome noise and aggression tilt
+        tilt = (power_a - power_b) / (power_a + power_b + 1e-9)
+        tilt += (random.random()-0.5)*0.2
+        tilt += (aggression - 0.5)*0.3
+        # losses
+        loss_a = 0.12 * power_b / (a.tech+0.5)
+        loss_b = 0.12 * power_a / (b.tech+0.5)
+        a.pop = max(0.0, a.pop - loss_a)
+        b.pop = max(0.0, b.pop - loss_b)
+        # morale hit
+        a.morale = max(0.0, a.morale - 0.15 + 0.10*tilt)
+        b.morale = max(0.0, b.morale - 0.15 - 0.10*tilt)
+        # tech attrition
+        a.tech = max(0.05, a.tech - 0.01*(1+aggression))
+        b.tech = max(0.05, b.tech - 0.01*(1+aggression))
+        # winner may annex tile
+        if tilt > 0.1:
+            a.territory.add((b.x,b.y)); b.x,b.y = a.x,a.y
+        elif tilt < -0.1:
+            b.territory.add((a.x,a.y)); a.x,a.y = b.x,b.y
+
+        if a.pop < 500: a.alive = False
+        if b.pop < 500: b.alive = False
+
+    def _try_expand_or_move(self, c):
+        # choose best neighbor by (resources * habitability * (1-damage))
+        best = None; best_score = -1
+        for dx,dy in self.N8:
+            nx, ny = c.x+dx, c.y+dy
+            if not self.in_bounds(nx,ny): continue
+            score = (self.resources[ny,nx] * self.habit[ny,nx] * (1.0 - 0.6*self.damage[ny,nx]))
+            # prefer new territory a bit
+            if (nx,ny) not in c.territory:
+                score *= 1.1
+            if score > best_score:
+                best_score = score; best = (nx,ny)
+        if best is None: return
+        nx, ny = best
+        # Move if strictly better; otherwise just add territory sometimes
+        here = self.resources[c.y,c.x]*self.habit[c.y,c.x]*(1.0-0.6*self.damage[c.y,c.x])
+        if best_score > here * (1.05 - min(0.2, 0.02*len(c.territory))):
+            c.x, c.y = nx, ny
+        else:
+            if random.random() < 0.3:
+                c.territory.add((nx,ny))
+
+    def _cosmic_event(self):
+        # Pick a random center and apply damage in a radius
+        cx = random.randrange(self.W); cy = random.randrange(self.H)
+        radius = random.randint(3, 8)
+        strength = random.uniform(0.3, 0.8)
+        y,x = np.mgrid[0:self.H,0:self.W]
+        d2 = (x-cx)**2 + (y-cy)**2
+        mask = d2 <= radius*radius
+        self.damage[mask] = np.maximum(self.damage[mask], strength * (1 - d2[mask]/(radius*radius+1e-9)))
+        # resource loss & habitability dip
+        self.resources[mask] *= (1 - 0.4*strength)
+        self.habit[mask]     *= (1 - 0.5*strength)
+
+# -----------------------------
+# GUI
+# -----------------------------
+
+class App(ttk.Frame):
+    def __init__(self, root):
+        super().__init__(root, padding=8)
+        root.title("Mini Universe Simulator — Matrix Toy Model")
+        root.geometry("1200x800")
+        root.minsize(1000, 680)
+        self.pack(fill="both", expand=True)
+
+        # Universe
+        self.U = Universe(W=70, H=45)
+
+        # State
+        self.running = False
+        self.dt = 1.0   # years per tick (abstract)
+        self.speed_ms = 50  # Tk timer interval
+
+        # Parameters (bound to sliders)
+        self.k_growth     = tk.DoubleVar(value=0.0008)
+        self.carry_base   = tk.DoubleVar(value=3e7)
+        self.exp_rate     = tk.DoubleVar(value=0.15)
+        self.trade_bias   = tk.DoubleVar(value=0.60)
+        self.aggression   = tk.DoubleVar(value=0.40)
+        self.event_rate   = tk.DoubleVar(value=0.02)
+
+        self._build_layout()
+        self._init_plot()
+        self._refresh_stats()
+        # Seed a couple of civs
+        for _ in range(3):
+            self.U.spawn_civ()
+
+    def _build_layout(self):
+        self.columnconfigure(0, weight=0)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.rowconfigure(1, weight=0)
+
+        # Left controls
+        left = ttk.Frame(self)
+        left.grid(row=0, column=0, sticky="nsw", padx=(0,10))
+        left.columnconfigure(0, weight=1)
+
+        # Buttons
+        bt_frame = ttk.Frame(left)
+        bt_frame.grid(row=0, column=0, sticky="ew", pady=(0,8))
+        ttk.Button(bt_frame, text="▶ Start", command=self.start).pack(side="left", padx=2)
+        ttk.Button(bt_frame, text="⏸ Pause", command=self.pause).pack(side="left", padx=2)
+        ttk.Button(bt_frame, text="⏭ Step",  command=self.step_once).pack(side="left", padx=6)
+        ttk.Button(bt_frame, text="↺ Reset", command=self.reset).pack(side="left", padx=2)
+        ttk.Button(bt_frame, text="+ Spawn Civ", command=self.spawn_civ).pack(side="left", padx=12)
+
+        # Speed
+        sp = ttk.LabelFrame(left, text="Simulation Speed")
+        sp.grid(row=1, column=0, sticky="ew", pady=6)
+        self.s_speed = ttk.Scale(sp, from_=20, to=300, value=self.speed_ms,
+                                 command=lambda v: setattr(self, "speed_ms", int(float(v))))
+        self.s_speed.pack(fill="x", padx=8, pady=6)
+        ttk.Label(sp, text="(lower = faster updates)").pack(pady=(0,6))
+
+        # Params
+        pf = ttk.LabelFrame(left, text="Parameters")
+        pf.grid(row=2, column=0, sticky="new", pady=6)
+        def add_row(label, var, from_, to_, step=0.01, fmt="{:.2f}"):
+            row = ttk.Frame(pf); row.pack(fill="x", padx=6, pady=4)
+            ttk.Label(row, text=label, width=18).pack(side="left")
+            val = ttk.Label(row, text=fmt.format(var.get())); val.pack(side="right")
+            sc = ttk.Scale(row, from_=from_, to=to_, value=var.get(),
+                           command=lambda v, L=val, V=var, F=fmt: (V.set(float(v)), L.configure(text=F.format(float(v)))))
+            sc.pack(fill="x", padx=8)
+
+        add_row("Growth k",          self.k_growth,   0.0002, 0.002, fmt="{:.4f}")
+        add_row("Carrying base",     self.carry_base, 5e6,    1e8,   fmt="{:.0f}")
+        add_row("Expansion rate",    self.exp_rate,   0.02,   0.5)
+        add_row("Trade bias",        self.trade_bias, 0.1,    0.9)
+        add_row("Aggression",        self.aggression, 0.0,    1.0)
+        add_row("Event rate",        self.event_rate, 0.0,    0.10)
+
+        # Bottom status
+        self.status = tk.StringVar(value="Ready.")
+        st = ttk.Label(self, textvariable=self.status, anchor="w", relief="groove", padding=6)
+        st.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10,0))
+
+        # Right plot
+        right = ttk.Frame(self)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        self.plot_frame = right
+
+        # Stats box
+        self.stats_box = tk.Text(left, height=12, width=40, font=("Courier New", 10))
+        self.stats_box.grid(row=3, column=0, sticky="ew", pady=6)
+        self.stats_box.configure(state="disabled")
+
+    def _init_plot(self):
+        self.fig, self.ax = plt.subplots(figsize=(8.5, 6.4))
+        self.ax.set_title("Galaxy Map — resources (background) & civilizations (dots)")
+        self.ax.set_xticks([]); self.ax.set_yticks([])
+        self.im = self.ax.imshow(self._render_background(), origin="upper", interpolation="nearest")
+        self.scat = self.ax.scatter([], [], s=[], c=[])
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+
+    def _render_background(self):
+        # Composite: resources dimmed by damage, tinted by habitability
+        R = self.U.resources.copy()
+        H = self.U.habit.copy()
+        D = self.U.damage.copy()
+        # Normalize
+        Rn = (R - R.min())/(R.max()-R.min()+1e-9)
+        Hn = (H - H.min())/(H.max()-H.min()+1e-9)
+        Dn = D
+        # RGB image: resources in blue/green, habitability in red, damage darkens
+        rgb = np.zeros((self.U.H, self.U.W, 3), dtype=float)
+        rgb[...,0] = 0.3*Hn + 0.1*Rn           # red ~ habitability
+        rgb[...,1] = 0.2*Rn + 0.05*Hn          # green ~ resources
+        rgb[...,2] = 0.65*Rn                   # blue ~ resources
+        # dim by damage
+        dim = (1 - 0.6*Dn)
+        rgb *= dim[...,None]
+        rgb = np.clip(rgb, 0, 1)
+        return rgb
+
+    def _update_plot(self):
+        self.im.set_data(self._render_background())
+        # Update civ scatter
+        xs, ys, sizes, cols = [], [], [], []
+        for c in self.U.civs:
+            xs.append(c.x); ys.append(c.y)
+            # visual size ~ log(pop)
+            sizes.append(20 + 10*math.log10(max(1.0, c.pop/1e4)))
+            cols.append(c.color)
+        if xs:
+            self.scat.set_offsets(np.c_[xs, ys])
+            self.scat.set_sizes(sizes)
+            self.scat.set_color(cols)
+        else:
+            self.scat.set_offsets(np.empty((0,2)))
+            self.scat.set_sizes([])
+            self.scat.set_color([])
+        self.ax.set_xlim(-0.5, self.U.W-0.5); self.ax.set_ylim(self.U.H-0.5, -0.5)
+        self.canvas.draw_idle()
+
+    def _refresh_stats(self):
+        total_pop = sum(c.pop for c in self.U.civs)
+        mean_tech = (sum(c.tech for c in self.U.civs)/len(self.U.civs)) if self.U.civs else 0.0
+        txt = []
+        txt.append(f"Time: {self.U.t:,.0f}  |  Civs: {len(self.U.civs)}")
+        txt.append(f"Total pop: {total_pop:,.0f}")
+        txt.append(f"Mean tech: {mean_tech:.3f}")
+        # top 5 civs by pop
+        top = sorted(self.U.civs, key=lambda c: c.pop, reverse=True)[:5]
+        txt.append("\nTop civilizations:")
+        for c in top:
+            txt.append(f"  {c.name:8s}  pop={c.pop:>10,.0f}  tech={c.tech:>5.2f}  age={c.age:>6.0f}")
+        self.stats_box.configure(state="normal")
+        self.stats_box.delete("1.0","end")
+        self.stats_box.insert("1.0", "\n".join(txt))
+        self.stats_box.configure(state="disabled")
+
+    # -----------------------------
+    # Controls
+    # -----------------------------
+    def start(self):
+        if self.running: return
+        self.running = True
+        self.status.set("Running…")
+        self._tick()
+
+    def pause(self):
+        self.running = False
+        self.status.set("Paused.")
+
+    def reset(self):
+        self.running = False
+        self.U = Universe(W=self.U.W, H=self.U.H)
+        for _ in range(3):
+            self.U.spawn_civ()
+        self._update_plot()
+        self._refresh_stats()
+        self.status.set("Reset.")
+
+    def spawn_civ(self):
+        c = self.U.spawn_civ()
+        self.status.set(f"Spawned {c.name} at ({c.x},{c.y}).")
+        self._update_plot()
+        self._refresh_stats()
+
+    def step_once(self):
+        self._simulate_once()
+        self.status.set("Stepped one tick.")
+
+    def _simulate_once(self):
+        self.U.step(
+            dt=self.dt,
+            k_growth=self.k_growth.get(),
+            carry_base=self.carry_base.get(),
+            expansion_rate=self.exp_rate.get(),
+            trade_bias=self.trade_bias.get(),
+            aggression=self.aggression.get(),
+            event_rate=self.event_rate.get(),
+        )
+        self._update_plot()
+        self._refresh_stats()
+
+    def _tick(self):
+        if not self.running: return
+        # run several micro-steps per frame for smoother dynamics
+        for _ in range(3):
+            self._simulate_once()
+        self.after(max(20, int(self.speed_ms)), self._tick)
+
+# -----------------------------
+# Run app
+# -----------------------------
+
+def main():
+    root = tk.Tk()
+    # Friendly ttk theme
+    style = ttk.Style(root)
+    if "clam" in style.theme_names():
+        style.theme_use("clam")
+    app = App(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
